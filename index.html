@@ -24,7 +24,7 @@
   .checks { display: flex; gap: 18px; font-size: 15px; flex-wrap: wrap; justify-content: center; }
   .checks label { display: flex; align-items: center; gap: 6px; }
   input[type=range] { width: 170px; }
-  #status, #sndstatus { font-size: 13px; color: #999; min-height: 1.2em; margin: 0; }
+  #status { font-size: 13px; color: #999; min-height: 1.2em; margin: 0; }
   #warn { font-size: 11px; color: #777; max-width: 320px; margin: 0; }
 
   /* Flash layer sits on top of everything (including blackout) but ignores touches */
@@ -52,12 +52,10 @@
 
   <div class="row"><span>Intensity</span><input type="range" id="intensity" min="1" max="10" value="5"></div>
   <div class="row"><span>Flash brightness</span><input type="range" id="bright" min="5" max="100" value="100"></div>
-  <div class="row"><span>Volume</span><input type="range" id="volume" min="0" max="100" value="80"></div>
 
   <div class="checks">
     <label><input type="checkbox" id="torch" checked> Torch</label>
     <label><input type="checkbox" id="screen" checked> Screen flash</label>
-    <label><input type="checkbox" id="sound" checked> Sound</label>
   </div>
 
   <div class="btnrow">
@@ -66,7 +64,6 @@
   </div>
 
   <p id="status">Tap start and allow camera access (needed for the torch).</p>
-  <p id="sndstatus"></p>
   <p id="warn">Contains rapid flashing light. Not suitable for people with photosensitive epilepsy.</p>
 </div>
 <div id="flash"></div>
@@ -110,52 +107,9 @@ async function setTorch(on) {
   try { await track.applyConstraints({ advanced: [{ torch: on }] }); } catch (e) {}
 }
 
-/* ---------- Shutter sound ---------- */
-// Put a single shutter click called shutter.mp3 next to index.html
-const SHUTTER_FILE = 'shutter.mp3';
-
-// Start downloading straight away so it's ready by the time START is tapped
-const rawShutter = fetch(SHUTTER_FILE)
-  .then(r => r.ok ? r.arrayBuffer() : null)
-  .catch(() => null);
-
-let ctx = null, master = null, shutterBuf = null;
-const cameraVoice = rand(0.92, 1.08); // each phone slightly different pitch
-
-function initAudio() {
-  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-  if (ctx) { ctx.resume(); return; }
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) return;
-  ctx = new AC();
-  master = ctx.createGain();
-  master.connect(ctx.destination);
-  loadShutter();
-}
-
-async function loadShutter() {
-  $('sndstatus').textContent = 'Loading shutter sound...';
-  const data = await rawShutter;
-  try { if (data) shutterBuf = await ctx.decodeAudioData(data); } catch (e) {}
-  $('sndstatus').textContent = shutterBuf
-    ? 'Shutter sound loaded.'
-    : 'No shutter sound found. Add shutter.mp3 next to index.html.';
-}
-
-function shutter() {
-  if (!ctx || !shutterBuf || !$('sound').checked) return;
-  master.gain.value = +$('volume').value / 100;
-  const s = ctx.createBufferSource();
-  s.buffer = shutterBuf;
-  s.playbackRate.value = cameraVoice * rand(0.98, 1.02);
-  s.connect(master);
-  s.start();
-}
-
 /* ---------- Flash engine ---------- */
-async function flashPop() {
-  const len = rand(35, 60);
-  shutter();
+async function pop() {
+  const len = rand(40, 90);
   if ($('screen').checked) $('flash').style.opacity = +$('bright').value / 100;
   await setTorch(true);
   await sleep(len);
@@ -163,29 +117,22 @@ async function flashPop() {
   await setTorch(false);
 }
 
-function burstFrames() {
+function burstSize() {
   const r = Math.random();
-  if (r < 0.45) return 1;                       // single shot
-  if (r < 0.75) return Math.floor(rand(2, 4));  // quick double/triple
-  if (r < 0.95) return Math.floor(rand(4, 7));  // short burst
-  return Math.floor(rand(7, 11));               // full spray
-}
-
-async function burst() {
-  const n = burstFrames();
-  const interval = rand(90, 160);
-  for (let i = 0; i < n && running; i++) {
-    const start = performance.now();
-    await flashPop();
-    const left = interval - (performance.now() - start);
-    if (left > 0) await sleep(left);
-  }
+  if (r < 0.5) return 1;
+  if (r < 0.8) return 2;
+  if (r < 0.95) return 3;
+  return Math.floor(rand(4, 7)); // occasional frenzy
 }
 
 async function loop() {
   await sleep(rand(0, 1500)); // stagger so phones never start together
   while (running) {
-    await burst();
+    const shots = burstSize();
+    for (let i = 0; i < shots && running; i++) {
+      await pop();
+      if (i < shots - 1) await sleep(rand(70, 220));
+    }
     const k = +$('intensity').value;     // 1 = sparse, 10 = frantic
     const maxGap = 4000 - k * 350;       // 3650ms down to 500ms
     await sleep(rand(150, maxGap));
@@ -202,7 +149,6 @@ async function keepAwake() {
 
 /* ---------- Controls ---------- */
 $('go').addEventListener('click', async () => {
-  initAudio(); // must happen straight from the tap for iOS
   if (running) {
     running = false;
     $('go').textContent = 'START';
@@ -222,7 +168,6 @@ $('torch').addEventListener('change', () => { if (!$('torch').checked) setTorch(
 
 // Camera view: tap the feed to exit
 $('camBtn').addEventListener('click', async () => {
-  initAudio();
   await ensureCamera();
   await keepAwake();
   document.body.classList.add('cam');
@@ -231,7 +176,6 @@ $('v').addEventListener('click', () => document.body.classList.remove('cam'));
 
 // Blackout: press and hold for 1 second to exit
 $('blackBtn').addEventListener('click', async () => {
-  initAudio();
   await keepAwake();
   document.body.classList.add('black');
 });

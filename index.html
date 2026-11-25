@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>Paparazzi Flash</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+    font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #ui { position: relative; z-index: 1; height: 100%; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 22px; padding: 24px; text-align: center; }
+  h1 { margin: 0; font-size: 28px; letter-spacing: 4px; text-transform: uppercase; }
+  #go { width: 180px; height: 180px; border-radius: 50%; border: 3px solid #fff;
+    background: #111; color: #fff; font-size: 26px; font-weight: 700; }
+  #go.on { background: #c00; border-color: #f55; }
+  label { font-size: 16px; display: flex; align-items: center; gap: 10px; }
+  input[type=range] { width: 180px; }
+  #status { font-size: 14px; color: #999; min-height: 1.2em; margin: 0; }
+  #warn { font-size: 12px; color: #777; max-width: 320px; margin: 0; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0;
+    pointer-events: none; z-index: 2; }
+  video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Paparazzi</h1>
+  <button id="go">START</button>
+  <label>Intensity <input type="range" id="intensity" min="1" max="10" value="5"></label>
+  <label><input type="checkbox" id="screen" checked> Flash screen too</label>
+  <p id="status">Tap start and allow camera access (needed for the torch).</p>
+  <p id="warn">Contains rapid flashing light. Not suitable for people with photosensitive epilepsy.</p>
+</div>
+<div id="flash"></div>
+<video id="v" playsinline muted autoplay></video>
+
+<script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const rand = (a, b) => a + Math.random() * (b - a);
+
+let track = null, torchOK = false, running = false, wakeLock = null;
+
+async function setupTorch() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } }, audio: false
+    });
+    $('v').srcObject = stream;
+    await $('v').play().catch(() => {});
+    track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    const isApple = /iPhone|iPad|iPod/.test(navigator.userAgent);
+    torchOK = !!caps.torch || isApple; // iOS doesn't always report it, so try anyway
+    await setTorch(false);
+    $('status').textContent = torchOK ? 'Torch ready.' : 'No torch control on this device, screen flash only.';
+  } catch (e) {
+    torchOK = false;
+    $('status').textContent = 'Camera not available, screen flash only.';
+  }
+}
+
+async function setTorch(on) {
+  if (!track || !torchOK || track.readyState === 'ended') return;
+  try { await track.applyConstraints({ advanced: [{ torch: on }] }); } catch (e) {}
+}
+
+async function pop() {
+  const len = rand(40, 90);
+  if ($('screen').checked) $('flash').style.opacity = 1;
+  await setTorch(true);
+  await sleep(len);
+  $('flash').style.opacity = 0;
+  await setTorch(false);
+}
+
+function burstSize() {
+  const r = Math.random();
+  if (r < 0.5) return 1;
+  if (r < 0.8) return 2;
+  if (r < 0.95) return 3;
+  return Math.floor(rand(4, 7)); // occasional frenzy
+}
+
+async function loop() {
+  await sleep(rand(0, 1500)); // stagger so phones never start together
+  while (running) {
+    const shots = burstSize();
+    for (let i = 0; i < shots && running; i++) {
+      await pop();
+      if (i < shots - 1) await sleep(rand(70, 220));
+    }
+    const k = +$('intensity').value;     // 1 = sparse, 10 = frantic
+    const maxGap = 4000 - k * 350;       // 3650ms down to 500ms
+    await sleep(rand(150, maxGap));
+  }
+  $('flash').style.opacity = 0;
+  await setTorch(false);
+}
+
+async function keepAwake() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) {}
+}
+
+$('go').addEventListener('click', async () => {
+  if (running) {
+    running = false;
+    $('go').textContent = 'START';
+    $('go').classList.remove('on');
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    return;
+  }
+  if (!track || track.readyState === 'ended') await setupTorch();
+  await keepAwake();
+  running = true;
+  $('go').textContent = 'STOP';
+  $('go').classList.add('on');
+  loop();
+});
+
+// iOS stops the camera when the page is hidden, so recover when it comes back
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && running) {
+    if (!track || track.readyState === 'ended') await setupTorch();
+    await keepAwake();
+  }
+});
+</script>
+</body>
+</html>

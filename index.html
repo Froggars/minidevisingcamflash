@@ -50,7 +50,7 @@
 
   <div class="row"><span>Intensity</span><input type="range" id="intensity" min="1" max="10" value="5"></div>
   <div class="row"><span>Flash brightness</span><input type="range" id="bright" min="5" max="100" value="100"></div>
-  <div class="row"><span>Volume</span><input type="range" id="volume" min="0" max="100" value="70"></div>
+  <div class="row"><span>Volume</span><input type="range" id="volume" min="0" max="100" value="80"></div>
 
   <div class="checks">
     <label><input type="checkbox" id="torch" checked> Torch</label>
@@ -74,6 +74,7 @@
 const $ = id => document.getElementById(id);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 
 let track = null, torchOK = false, running = false, wakeLock = null;
 
@@ -107,9 +108,16 @@ async function setTorch(on) {
   try { await track.applyConstraints({ advanced: [{ torch: on }] }); } catch (e) {}
 }
 
-/* ---------- Sound (synthesised, no files) ---------- */
+/* ---------- Sound ---------- */
+// Optional real recordings: put these files next to index.html. Missing ones are skipped.
+const SAMPLE_FILES = {
+  shutter: ['shutter1.mp3', 'shutter2.mp3', 'shutter3.mp3'],
+  whine:   ['whine.mp3']
+};
+const samples = { shutter: [], whine: [] };
+
 let ctx = null, master = null, noiseBuf = null;
-const cameraVoice = rand(0.8, 1.25); // each phone sounds like a different camera
+const cameraVoice = rand(0.85, 1.15); // each phone sounds like a different camera body
 
 function initAudio() {
   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
@@ -117,11 +125,35 @@ function initAudio() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return;
   ctx = new AC();
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.ratio.value = 4;
   master = ctx.createGain();
-  master.connect(ctx.destination);
-  noiseBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.2), ctx.sampleRate);
+  master.connect(comp).connect(ctx.destination);
+  noiseBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.3), ctx.sampleRate);
   const d = noiseBuf.getChannelData(0);
   for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  loadSamples();
+}
+
+async function loadSamples() {
+  for (const [kind, files] of Object.entries(SAMPLE_FILES)) {
+    for (const f of files) {
+      try {
+        const res = await fetch(f);
+        if (!res.ok) continue;
+        const data = await res.arrayBuffer();
+        samples[kind].push(await ctx.decodeAudioData(data));
+      } catch (e) {}
+    }
+  }
+}
+
+function playSample(buf, rate, gain) {
+  const s = ctx.createBufferSource();
+  s.buffer = buf; s.playbackRate.value = rate;
+  const g = ctx.createGain(); g.gain.value = gain;
+  s.connect(g).connect(master);
+  s.start();
 }
 
 function soundOn() {
@@ -130,69 +162,99 @@ function soundOn() {
   return true;
 }
 
-function click(t, freq, dur, gain) {
+function noiseHit(t, type, freq, q, dur, gain) {
   const src = ctx.createBufferSource(); src.buffer = noiseBuf;
-  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
-  bp.frequency.value = freq; bp.Q.value = 1.2;
+  const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
   const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.001);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f).connect(g).connect(master);
+  src.start(t, Math.random() * 0.15); src.stop(t + dur + 0.02);
+}
+
+function thump(t, freq, dur, gain) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(freq * 0.5, t + dur);
   g.gain.setValueAtTime(gain, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  src.connect(bp).connect(g).connect(master);
-  src.start(t); src.stop(t + dur + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(master);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+
+function synthShutter() {
+  const t = ctx.currentTime, v = cameraVoice * rand(0.97, 1.03);
+  // "ka" - mirror up + first curtain: sharp clack with body thump
+  noiseHit(t, 'highpass', 3500 * v, 0.7, 0.012, 0.9);
+  noiseHit(t, 'bandpass', 1400 * v, 1.5, 0.04, 0.7);
+  thump(t, 200 * v, 0.045, 0.6);
+  // "chak" - mirror down + curtain reset
+  const t2 = t + rand(0.045, 0.07);
+  noiseHit(t2, 'highpass', 2800 * v, 0.7, 0.01, 0.6);
+  noiseHit(t2, 'bandpass', 1100 * v, 1.5, 0.05, 0.55);
+  thump(t2, 150 * v, 0.05, 0.45);
 }
 
 function shutter() {
   if (!soundOn()) return;
-  const t = ctx.currentTime;
-  const f = cameraVoice * rand(0.95, 1.05);
-  click(t, 3200 * f, 0.03, 1.0);                     // shutter open
-  click(t + rand(0.05, 0.08), 1700 * f, 0.05, 0.8);  // mirror slap / close
+  if (samples.shutter.length) playSample(pick(samples.shutter), cameraVoice * rand(0.97, 1.03), 1);
+  else synthShutter();
 }
 
 function rechargeWhine() {
   if (!soundOn()) return;
+  if (samples.whine.length) { playSample(pick(samples.whine), rand(0.95, 1.05), 0.6); return; }
   const t = ctx.currentTime;
   const o = ctx.createOscillator(), g = ctx.createGain();
   o.type = 'sine';
-  o.frequency.setValueAtTime(rand(1800, 2500), t);
-  o.frequency.exponentialRampToValueAtTime(rand(5500, 7500), t + 0.9);
+  o.frequency.setValueAtTime(rand(2500, 3200), t);
+  o.frequency.exponentialRampToValueAtTime(rand(8000, 9500), t + 1.1);
   g.gain.setValueAtTime(0, t);
-  g.gain.linearRampToValueAtTime(0.05, t + 0.1);
-  g.gain.linearRampToValueAtTime(0, t + 0.9);
+  g.gain.linearRampToValueAtTime(0.04, t + 0.15);
+  g.gain.linearRampToValueAtTime(0, t + 1.1);
   o.connect(g).connect(master);
-  o.start(t); o.stop(t + 0.95);
+  o.start(t); o.stop(t + 1.15);
 }
 
 /* ---------- Flash engine ---------- */
-async function pop() {
-  const len = rand(40, 90);
-  shutter();
-  if ($('screen').checked) {
-    $('flash').style.opacity = +$('bright').value / 100; // hidden anyway in camera/blackout
-  }
+async function flashPop() {
+  const len = rand(35, 60);
+  if ($('screen').checked) $('flash').style.opacity = +$('bright').value / 100;
   await setTorch(true);
   await sleep(len);
   $('flash').style.opacity = 0;
   await setTorch(false);
 }
 
-function burstSize() {
+function burstFrames() {
   const r = Math.random();
-  if (r < 0.5) return 1;
-  if (r < 0.8) return 2;
-  if (r < 0.95) return 3;
-  return Math.floor(rand(4, 7)); // occasional frenzy
+  if (r < 0.35) return 1;                       // single shot
+  if (r < 0.6)  return Math.floor(rand(2, 4));  // quick double/triple
+  if (r < 0.88) return Math.floor(rand(4, 8));  // short motor-drive burst
+  return Math.floor(rand(8, 15));               // full spray
+}
+
+async function burst() {
+  const n = burstFrames();
+  const interval = rand(80, 125);  // 8-12 frames per second
+  let flashed = false;
+  for (let i = 0; i < n && running; i++) {
+    const start = performance.now();
+    shutter();
+    if (i === 0 || Math.random() < 0.45) { await flashPop(); flashed = true; }
+    const left = interval - (performance.now() - start);
+    if (left > 0) await sleep(left);
+  }
+  return flashed;
 }
 
 async function loop() {
   await sleep(rand(0, 1500)); // stagger so phones never start together
   while (running) {
-    const shots = burstSize();
-    for (let i = 0; i < shots && running; i++) {
-      await pop();
-      if (i < shots - 1) await sleep(rand(70, 220));
-    }
-    if (running && Math.random() < 0.3) rechargeWhine();
+    const flashed = await burst();
+    if (running && flashed && Math.random() < 0.3) rechargeWhine();
     const k = +$('intensity').value;     // 1 = sparse, 10 = frantic
     const maxGap = 4000 - k * 350;       // 3650ms down to 500ms
     await sleep(rand(150, maxGap));

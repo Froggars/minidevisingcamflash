@@ -24,7 +24,7 @@
   .checks { display: flex; gap: 18px; font-size: 15px; flex-wrap: wrap; justify-content: center; }
   .checks label { display: flex; align-items: center; gap: 6px; }
   input[type=range] { width: 170px; }
-  #status { font-size: 13px; color: #999; min-height: 1.2em; margin: 0; }
+  #status, #sndstatus { font-size: 13px; color: #999; min-height: 1.2em; margin: 0; }
   #warn { font-size: 11px; color: #777; max-width: 320px; margin: 0; }
 
   /* Flash layer sits on top of everything (including blackout) but ignores touches */
@@ -66,6 +66,7 @@
   </div>
 
   <p id="status">Tap start and allow camera access (needed for the torch).</p>
+  <p id="sndstatus"></p>
   <p id="warn">Contains rapid flashing light. Not suitable for people with photosensitive epilepsy.</p>
 </div>
 <div id="flash"></div>
@@ -110,16 +111,27 @@ async function setTorch(on) {
   try { await track.applyConstraints({ advanced: [{ torch: on }] }); } catch (e) {}
 }
 
-/* ---------- Sound ---------- */
-// Optional real recordings: put these files next to index.html. Missing ones are skipped.
-const SAMPLE_FILES = {
-  shutter: ['shutter1.mp3', 'shutter2.mp3', 'shutter3.mp3'],
-  whine:   ['whine.mp3']
-};
-const samples = { shutter: [], whine: [] };
+/* ---------- Sound: real paparazzi recordings ---------- */
+// Put these files next to index.html.
+const SOUND_FILES = ['paparazzi1.mp3', 'paparazzi2.mp3'];
 
-let ctx = null, master = null, noiseBuf = null;
-const cameraVoice = rand(0.88, 1.12); // each phone sounds like a different camera body
+// Optional: time ranges (seconds) in each file to never use, e.g. [[12.0, 14.5]]
+const SKIP = {
+  'paparazzi1.mp3': [],
+  'paparazzi2.mp3': []
+};
+
+const MAX_GAP = 0.3; // clicks further apart than this aren't joined (keeps out pauses/whines)
+
+// Start downloading straight away so they're ready by the time START is tapped
+const rawFiles = Promise.all(SOUND_FILES.map(name =>
+  fetch(name)
+    .then(r => r.ok ? r.arrayBuffer().then(data => ({ name, data })) : null)
+    .catch(() => null)
+));
+
+let ctx = null, master = null, clips = [];
+const cameraVoice = rand(0.93, 1.07); // each phone slightly different pitch
 
 function initAudio() {
   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
@@ -127,167 +139,130 @@ function initAudio() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return;
   ctx = new AC();
-  const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -20; comp.ratio.value = 5; comp.attack.value = 0.001;
   master = ctx.createGain();
-  master.connect(comp).connect(ctx.destination);
-  noiseBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.3), ctx.sampleRate);
-  const d = noiseBuf.getChannelData(0);
-  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
-  loadSamples();
+  master.connect(ctx.destination);
+  decodeClips();
 }
 
-async function loadSamples() {
-  for (const [kind, files] of Object.entries(SAMPLE_FILES)) {
-    for (const f of files) {
-      try {
-        const res = await fetch(f);
-        if (!res.ok) continue;
-        const data = await res.arrayBuffer();
-        samples[kind].push(await ctx.decodeAudioData(data));
-      } catch (e) {}
+async function decodeClips() {
+  $('sndstatus').textContent = 'Loading sounds...';
+  const files = await rawFiles;
+  for (const f of files) {
+    if (!f) continue;
+    try {
+      const buf = await ctx.decodeAudioData(f.data);
+      const skip = SKIP[f.name] || [];
+      const onsets = findOnsets(buf).filter(t => !skip.some(([a, b]) => t >= a - 0.2 && t <= b + 0.2));
+      if (onsets.length) clips.push({ buf, onsets });
+    } catch (e) {}
+  }
+  $('sndstatus').textContent = clips.length
+    ? `Shutter sounds loaded (${clips.length} file${clips.length > 1 ? 's' : ''}).`
+    : 'No sound files found. Add paparazzi1.mp3 / paparazzi2.mp3 next to index.html.';
+}
+
+// Find the moment each shutter click starts, from sudden jumps in loudness
+function findOnsets(buf) {
+  const data = buf.getChannelData(0);
+  const sr = buf.sampleRate, step = 0.005, win = Math.floor(sr * step);
+  const env = [];
+  for (let i = 0; i + win <= data.length; i += win) {
+    let s = 0;
+    for (let j = i; j < i + win; j++) s += data[j] * data[j];
+    env.push(Math.sqrt(s / win));
+  }
+  const sorted = [...env].sort((a, b) => a - b);
+  const floor = sorted[Math.floor(sorted.length * 0.5)];
+  const peak = sorted[Math.floor(sorted.length * 0.995)];
+  const thresh = floor + (peak - floor) * 0.25;
+  const onsets = [];
+  let last = -1;
+  for (let k = 4; k < env.length; k++) {
+    const prev = (env[k - 1] + env[k - 2] + env[k - 3] + env[k - 4]) / 4;
+    if (env[k] > thresh && env[k] > prev * 2.5) {
+      const t = k * step;
+      if (last < 0 || t - last > 0.06) { onsets.push(t); last = t; }
     }
   }
+  return onsets;
 }
 
-function playSample(buf, rate, gain) {
-  const s = ctx.createBufferSource();
-  s.buffer = buf; s.playbackRate.value = rate;
-  const g = ctx.createGain(); g.gain.value = gain;
-  s.connect(g).connect(master);
-  s.start();
-}
-
-function soundOn() {
-  if (!ctx || !$('sound').checked) return false;
-  master.gain.value = +$('volume').value / 100;
-  return true;
-}
-
-// Filtered noise hit with a fast attack and exponential decay
-function noiseHit(t, type, freq, q, dur, gain) {
-  const src = ctx.createBufferSource(); src.buffer = noiseBuf;
-  const f = ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0.0001, t);
-  g.gain.exponentialRampToValueAtTime(gain, t + 0.001);
-  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  src.connect(f).connect(g).connect(master);
-  src.start(t, Math.random() * 0.15); src.stop(t + dur + 0.02);
-}
-
-// Very short broadband crack (the attack of each mechanical event)
-function crack(t, gain) {
-  noiseHit(t, 'highpass', 800, 0.5, 0.004, gain);
-}
-
-// Brief metallic ring from the shutter blades and body
-function ring(t, freqs, dur, gain) {
-  freqs.forEach(f => {
-    const o = ctx.createOscillator(), g = ctx.createGain();
-    const d = dur * rand(0.7, 1.2);
-    o.type = 'sine'; o.frequency.value = f;
-    g.gain.setValueAtTime(gain, t);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
-    o.connect(g).connect(master);
-    o.start(t); o.stop(t + d + 0.02);
-  });
-}
-
-// Shutter re-cock motor: short, ratchety, slightly falling whirr
-function motor(t, dur, freq, gain) {
-  const src = ctx.createBufferSource(); src.buffer = noiseBuf;
-  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 4;
-  bp.frequency.setValueAtTime(freq, t);
-  bp.frequency.linearRampToValueAtTime(freq * 0.75, t + dur);
-  const am = ctx.createGain(); am.gain.value = 0.5;            // gear ratchet texture
-  const lfo = ctx.createOscillator(), lfoG = ctx.createGain();
-  lfo.type = 'square'; lfo.frequency.value = rand(260, 340); lfoG.gain.value = 0.5;
-  lfo.connect(lfoG).connect(am.gain);
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0.0001, t);
-  g.gain.linearRampToValueAtTime(gain, t + 0.004);
-  g.gain.setValueAtTime(gain, t + dur - 0.006);
-  g.gain.linearRampToValueAtTime(0.0001, t + dur);
-  src.connect(bp).connect(am).connect(g).connect(master);
-  src.start(t, Math.random() * 0.1); src.stop(t + dur + 0.02);
-  lfo.start(t); lfo.stop(t + dur + 0.02);
-}
-
-function synthShutter() {
-  const t = ctx.currentTime, v = cameraVoice * rand(0.97, 1.03);
-  // 1. "KA" - mirror up + first curtain
-  crack(t, 1.0);
-  noiseHit(t, 'bandpass', 2400 * v, 0.9, 0.025, 0.8);
-  noiseHit(t, 'lowpass', 600 * v, 0.7, 0.03, 0.5);
-  ring(t, [3150 * v, 4730 * v, 7290 * v], 0.03, 0.06);
-  // 2. "CHK" - second curtain + mirror down
-  const t2 = t + rand(0.035, 0.05);
-  crack(t2, 0.7);
-  noiseHit(t2, 'bandpass', 1700 * v, 1.0, 0.03, 0.6);
-  ring(t2, [2650 * v, 5900 * v], 0.025, 0.045);
-  // 3. Motor re-cocking the shutter
-  motor(t2 + 0.012, rand(0.03, 0.045), 1600 * v, 0.28);
-}
-
-function shutter() {
-  if (!soundOn()) return;
-  if (samples.shutter.length) playSample(pick(samples.shutter), cameraVoice * rand(0.97, 1.03), 1);
-  else synthShutter();
-}
-
-function rechargeWhine() {
-  if (!soundOn()) return;
-  if (samples.whine.length) { playSample(pick(samples.whine), rand(0.95, 1.05), 0.6); return; }
-  const t = ctx.currentTime;
-  const o = ctx.createOscillator(), g = ctx.createGain();
-  o.type = 'sine';
-  o.frequency.setValueAtTime(rand(2500, 3200), t);
-  o.frequency.exponentialRampToValueAtTime(rand(8000, 9500), t + 1.1);
-  g.gain.setValueAtTime(0, t);
-  g.gain.linearRampToValueAtTime(0.04, t + 0.15);
-  g.gain.linearRampToValueAtTime(0, t + 1.1);
-  o.connect(g).connect(master);
-  o.start(t); o.stop(t + 1.15);
-}
-
-/* ---------- Flash engine ---------- */
+/* ---------- Flash ---------- */
+let flashing = false;
 async function flashPop() {
+  if (flashing) return;
+  flashing = true;
   const len = rand(35, 60);
   if ($('screen').checked) $('flash').style.opacity = +$('bright').value / 100;
   await setTorch(true);
   await sleep(len);
   $('flash').style.opacity = 0;
   await setTorch(false);
+  flashing = false;
 }
 
 function burstFrames() {
   const r = Math.random();
   if (r < 0.35) return 1;                       // single shot
   if (r < 0.6)  return Math.floor(rand(2, 4));  // quick double/triple
-  if (r < 0.88) return Math.floor(rand(4, 8));  // short motor-drive burst
+  if (r < 0.88) return Math.floor(rand(4, 8));  // short burst
   return Math.floor(rand(8, 15));               // full spray
 }
 
-async function burst() {
-  const n = burstFrames();
-  const interval = rand(80, 125);  // 8-12 frames per second
-  let flashed = false;
+// Burst using a run of real clicks from a recording, with flashes on the clicks
+async function sampleBurst(maxFrames) {
+  const clip = pick(clips), o = clip.onsets;
+  let i = Math.floor(Math.random() * o.length);
+  const run = [o[i]];
+  while (run.length < maxFrames && i + 1 < o.length && o[i + 1] - o[i] < MAX_GAP) {
+    i++; run.push(o[i]);
+  }
+  const rate = cameraVoice;
+  const from = Math.max(0, run[0] - 0.02);
+  const to = Math.min(clip.buf.duration, run[run.length - 1] + 0.15);
+  const dur = to - from, realDur = dur / rate;
+
+  master.gain.value = +$('volume').value / 100;
+  const t = ctx.currentTime + 0.03;
+  const src = ctx.createBufferSource();
+  src.buffer = clip.buf; src.playbackRate.value = rate;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(1, t + 0.008);
+  g.gain.setValueAtTime(1, Math.max(t + 0.01, t + realDur - 0.03));
+  g.gain.linearRampToValueAtTime(0, t + realDur);
+  src.connect(g).connect(master);
+  src.start(t, from, dur);
+
+  const latency = ctx.outputLatency || ctx.baseLatency || 0;
+  const t0 = performance.now() + (0.03 + latency) * 1000;
+  for (let k = 0; k < run.length && running; k++) {
+    const wait = t0 + (run[k] - from) / rate * 1000 - performance.now();
+    if (wait > 0) await sleep(wait);
+    if (k === 0 || Math.random() < 0.5) flashPop();
+  }
+  const endWait = t0 + realDur * 1000 - performance.now();
+  if (running && endWait > 0) await sleep(endWait);
+  if (!running) { try { src.stop(); } catch (e) {} }
+}
+
+// Silent burst (used when sound is off or files are missing)
+async function silentBurst(n) {
+  const interval = rand(80, 125);
   for (let i = 0; i < n && running; i++) {
     const start = performance.now();
-    shutter();
-    if (i === 0 || Math.random() < 0.45) { await flashPop(); flashed = true; }
+    if (i === 0 || Math.random() < 0.45) await flashPop();
     const left = interval - (performance.now() - start);
     if (left > 0) await sleep(left);
   }
-  return flashed;
 }
 
 async function loop() {
   await sleep(rand(0, 1500)); // stagger so phones never start together
   while (running) {
-    const flashed = await burst();
-    if (running && flashed && Math.random() < 0.3) rechargeWhine();
+    const n = burstFrames();
+    if ($('sound').checked && ctx && clips.length) await sampleBurst(n);
+    else await silentBurst(n);
     const k = +$('intensity').value;     // 1 = sparse, 10 = frantic
     const maxGap = 4000 - k * 350;       // 3650ms down to 500ms
     await sleep(rand(150, maxGap));

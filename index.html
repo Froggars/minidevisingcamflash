@@ -16,8 +16,9 @@
   #go { width: 160px; height: 160px; border-radius: 50%; border: 3px solid #fff;
     background: #111; color: #fff; font-size: 24px; font-weight: 700; }
   #go.on { background: #c00; border-color: #f55; }
-  #camBtn { padding: 12px 22px; border-radius: 24px; border: 2px solid #888;
+  #camBtn, #blackBtn { padding: 12px 22px; border-radius: 24px; border: 2px solid #888;
     background: #111; color: #fff; font-size: 16px; font-weight: 600; }
+  .btnrow { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
   .row { display: grid; grid-template-columns: 110px 170px; align-items: center;
     gap: 10px; font-size: 15px; text-align: left; }
   .checks { display: flex; gap: 18px; font-size: 15px; flex-wrap: wrap; justify-content: center; }
@@ -29,10 +30,17 @@
     pointer-events: none; z-index: 2; }
   video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
-  /* Camera view: full-screen feed, nothing else */
+  /* Camera view: full-screen feed, nothing else. Tap to exit. */
   body.cam #ui, body.cam #flash { display: none; }
   body.cam video { inset: 0; width: 100%; height: 100%; opacity: 1;
     object-fit: cover; z-index: 3; pointer-events: auto; background: #000; }
+
+  /* Blackout: pure black screen. Press and hold to exit. */
+  #black { position: fixed; inset: 0; background: #000; z-index: 4; display: none;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; }
+  body.black #black { display: block; }
+  body.black #ui, body.black #flash { display: none; }
 </style>
 </head>
 <body>
@@ -50,13 +58,17 @@
     <label><input type="checkbox" id="sound" checked> Sound</label>
   </div>
 
-  <button id="camBtn">CAMERA VIEW</button>
+  <div class="btnrow">
+    <button id="camBtn">CAMERA VIEW</button>
+    <button id="blackBtn">BLACKOUT</button>
+  </div>
 
   <p id="status">Tap start and allow camera access (needed for the torch).</p>
   <p id="warn">Contains rapid flashing light. Not suitable for people with photosensitive epilepsy.</p>
 </div>
 <div id="flash"></div>
 <video id="v" playsinline muted autoplay></video>
+<div id="black"></div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -102,4 +114,152 @@ const cameraVoice = rand(0.8, 1.25); // each phone sounds like a different camer
 function initAudio() {
   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
   if (ctx) { ctx.resume(); return; }
-  const AC =
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  ctx = new AC();
+  master = ctx.createGain();
+  master.connect(ctx.destination);
+  noiseBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.2), ctx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+}
+
+function soundOn() {
+  if (!ctx || !$('sound').checked) return false;
+  master.gain.value = +$('volume').value / 100;
+  return true;
+}
+
+function click(t, freq, dur, gain) {
+  const src = ctx.createBufferSource(); src.buffer = noiseBuf;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
+  bp.frequency.value = freq; bp.Q.value = 1.2;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(gain, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  src.connect(bp).connect(g).connect(master);
+  src.start(t); src.stop(t + dur + 0.02);
+}
+
+function shutter() {
+  if (!soundOn()) return;
+  const t = ctx.currentTime;
+  const f = cameraVoice * rand(0.95, 1.05);
+  click(t, 3200 * f, 0.03, 1.0);                     // shutter open
+  click(t + rand(0.05, 0.08), 1700 * f, 0.05, 0.8);  // mirror slap / close
+}
+
+function rechargeWhine() {
+  if (!soundOn()) return;
+  const t = ctx.currentTime;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(rand(1800, 2500), t);
+  o.frequency.exponentialRampToValueAtTime(rand(5500, 7500), t + 0.9);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.05, t + 0.1);
+  g.gain.linearRampToValueAtTime(0, t + 0.9);
+  o.connect(g).connect(master);
+  o.start(t); o.stop(t + 0.95);
+}
+
+/* ---------- Flash engine ---------- */
+async function pop() {
+  const len = rand(40, 90);
+  shutter();
+  if ($('screen').checked) {
+    $('flash').style.opacity = +$('bright').value / 100; // hidden anyway in camera/blackout
+  }
+  await setTorch(true);
+  await sleep(len);
+  $('flash').style.opacity = 0;
+  await setTorch(false);
+}
+
+function burstSize() {
+  const r = Math.random();
+  if (r < 0.5) return 1;
+  if (r < 0.8) return 2;
+  if (r < 0.95) return 3;
+  return Math.floor(rand(4, 7)); // occasional frenzy
+}
+
+async function loop() {
+  await sleep(rand(0, 1500)); // stagger so phones never start together
+  while (running) {
+    const shots = burstSize();
+    for (let i = 0; i < shots && running; i++) {
+      await pop();
+      if (i < shots - 1) await sleep(rand(70, 220));
+    }
+    if (running && Math.random() < 0.3) rechargeWhine();
+    const k = +$('intensity').value;     // 1 = sparse, 10 = frantic
+    const maxGap = 4000 - k * 350;       // 3650ms down to 500ms
+    await sleep(rand(150, maxGap));
+  }
+  $('flash').style.opacity = 0;
+  await setTorch(false);
+}
+
+async function keepAwake() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) {}
+}
+
+/* ---------- Controls ---------- */
+$('go').addEventListener('click', async () => {
+  initAudio(); // must happen straight from the tap for iOS
+  if (running) {
+    running = false;
+    $('go').textContent = 'START';
+    $('go').classList.remove('on');
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    return;
+  }
+  await ensureCamera();
+  await keepAwake();
+  running = true;
+  $('go').textContent = 'STOP';
+  $('go').classList.add('on');
+  loop();
+});
+
+$('torch').addEventListener('change', () => { if (!$('torch').checked) setTorch(false); });
+
+// Camera view: tap the feed to exit
+$('camBtn').addEventListener('click', async () => {
+  initAudio();
+  await ensureCamera();
+  await keepAwake();
+  document.body.classList.add('cam');
+});
+$('v').addEventListener('click', () => document.body.classList.remove('cam'));
+
+// Blackout: press and hold for 1 second to exit
+$('blackBtn').addEventListener('click', async () => {
+  initAudio();
+  await keepAwake();
+  document.body.classList.add('black');
+});
+let holdTimer = null;
+$('black').addEventListener('pointerdown', () => {
+  holdTimer = setTimeout(() => document.body.classList.remove('black'), 1000);
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
+  $('black').addEventListener(ev, () => clearTimeout(holdTimer))
+);
+
+// iOS stops the camera when the page is hidden, so recover when it comes back
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible') {
+    const b = document.body.classList;
+    if (running || b.contains('cam') || b.contains('black')) {
+      await ensureCamera();
+      await keepAwake();
+    }
+  }
+});
+</script>
+</body>
+</html>
